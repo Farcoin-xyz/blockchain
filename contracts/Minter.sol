@@ -2,125 +2,158 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/proxy/Clones.sol";
-import {Fide} from "./Fide.sol";
+import {FIDE} from "./FIDE.sol";
 
 contract Minter {
-    mapping(uint => address) _fides;
-    address private _fideTemplate;
-    address private _governance;
-    address private _oracle;
-    address private _DAO;
+    address private immutable _fideTemplate;
+    address private immutable _vault;
 
-    modifier onlyGovernance {
-        require(msg.sender == _governance, "Not Governance");
-        _;
-    }
+    address private _oracle;
+
+    mapping(uint => uint) _claimNonces;
+    mapping(uint => address) private _fides;
+    mapping(uint => mapping(uint => uint)) _lastLikeTimes;
 
     modifier onlyOracle {
         require(msg.sender == _oracle, "Not Oracle");
         _;
     }
 
-    modifier onlyDAO {
-        require(msg.sender == _DAO, "Not DAO");
+    modifier onlyVault {
+        require(msg.sender == _vault, "Not Vault");
         _;
     }
 
     event Mint(
-        uint indexed FID,
-        address indexed fide,
-        address indexed recipient,
+        uint indexed likerFID,
+        uint indexed likedFID,
+        address liker,
+        address liked,
         uint quantity,
+        uint firstLikeTime,
+        uint lastLikeTime,
         uint timestamp
     );
 
     event Claim(
-        uint indexed FID,
-        address indexed fide,
-        address indexed recipient,
+        uint indexed likerFID,
+        address liker,
+        uint nonce,
         uint quantity,
         uint timestamp
     );
 
-    constructor(address DAO) {
-        _fideTemplate = address(new Fide());
-        _governance = msg.sender;
-        _DAO = DAO;
+    constructor(address vault) {
+        _fideTemplate = address(new FIDE());
+        _vault = vault;
     }
 
-    function _mint(uint FID, address recipient, uint quantity, address fideTemplate, address DAO) private {
-        address fide = _fides[FID];
+    function _mint(
+        uint likerFID,
+        uint likedFID,
+        address liker,
+        address liked,
+        uint quantity,
+        uint firstLikeTime,
+        uint lastLikeTime
+    ) private {
+        require(firstLikeTime <= lastLikeTime, "Invalid Time Range");
+        require(firstLikeTime > _lastLikeTimes[likerFID][likedFID], "Range Already Minted");
+
+        _lastLikeTimes[likerFID][likedFID] = lastLikeTime;
+
+        address fide = _fides[likerFID];
         if (fide == address(0)) {
-            fide = Clones.cloneDeterministic(fideTemplate, bytes32(FID));
-            Fide(fide).initAndMint(FID, recipient, quantity, DAO);
-            _fides[FID] = fide;
+            fide = Clones.cloneDeterministic(_fideTemplate, bytes32(likerFID));
+            _fides[likerFID] = fide;
+            FIDE(fide).initAndMint(likerFID, liker, liked, quantity, _vault);
         } else {
-            Fide(fide).mint(recipient, quantity, DAO);
+            FIDE(fide).mint(liker, liked, quantity, _vault);
         }
-        emit Mint(FID, fide, recipient, quantity, block.timestamp);
+        emit Mint(likerFID, likedFID, liker, liked, quantity, firstLikeTime, lastLikeTime, block.timestamp);
     }
 
-    function mint(uint FID, address recipient, uint quantity) external onlyOracle {
-        _mint(FID, recipient, quantity, _fideTemplate, _DAO);
+    function mint(
+        uint likerFID,
+        uint likedFID,
+        address liker,
+        address liked,
+        uint quantity,
+        uint firstLikeTime,
+        uint lastLikeTime
+    ) external onlyOracle {
+        _mint(likerFID, likedFID, liker, liked, quantity, firstLikeTime, lastLikeTime);
     }
 
-    function mint(uint[] memory FIDs, address[] memory recipients, uint[] memory quantities) external onlyOracle {
-        address fideTemplate = _fideTemplate;
-        address DAO = _DAO;
-        for (uint i = 0; i < FIDs.length; i++) {
-            _mint(FIDs[i], recipients[i], quantities[i], fideTemplate, DAO);
+    function mint(
+        uint[] memory likerFIDs,
+        uint[] memory likedFIDs,
+        address[] memory likers,
+        address[] memory likeds,
+        uint[] memory quantities,
+        uint[] memory firstLikeTimes,
+        uint[] memory lastLikeTimes
+    ) external onlyOracle {
+        for (uint i = 0; i < likerFIDs.length; i++) {
+            _mint(likerFIDs[i], likedFIDs[i], likers[i], likeds[i], quantities[i], firstLikeTimes[i], lastLikeTimes[i]);
         }
     }
 
-    function _claim(uint FID, address recipient) private returns (uint) {
+    function _claim(uint FID, address liker, uint nonce) private {
         address fide = _fides[FID];
-        require(fide != address(0), "Fide Not Found");
+        require(fide != address(0), "FIDE Not Found");
+        require(_claimNonces[FID] + 1 == nonce, "Invalid Nonce");
+        _claimNonces[FID] = nonce;
 
-        uint quantity = Fide(fide).claim(recipient);
+        uint quantity = FIDE(fide).claim(liker);
 
-        emit Claim(FID, fide, recipient, quantity, block.timestamp);
-
-        return quantity;
+        emit Claim(FID, liker, nonce, quantity, block.timestamp);
     }
 
-    function claim(uint FID, address recipient) external onlyOracle returns (uint) {
-        return _claim(FID, recipient);
+    function claim(uint FID, address liked, uint nonce) external onlyOracle {
+        _claim(FID, liked, nonce);
     }
 
-    function claim(uint[] memory FIDs, address[] memory recipients) external onlyOracle returns (uint[] memory) {
-        uint[] memory quantities = new uint[](FIDs.length);
+    function claim(uint[] memory FIDs, address[] memory likeds, uint[] memory nonces) external onlyOracle {
         for (uint i = 0; i < FIDs.length; i++) {
-            quantities[i] = _claim(FIDs[i], recipients[i]);
+            _claim(FIDs[i], likeds[i], nonces[i]);
         }
-        return quantities;
     }
 
-    function setGovernance(address governance) external onlyGovernance {
-        _governance = governance;
-    }
-
-    function setOracle(address oracle) external onlyGovernance {
+    function setOracle(address oracle) external onlyVault {
         _oracle = oracle;
     }
 
-    function setDAO(address DAO) external onlyDAO {
-        _DAO = DAO;
-    }
-
-    function getGovernance() external view returns (address) {
-        return _governance;
+    function getFideTemplate() external view returns (address) {
+        return _fideTemplate;
     }
 
     function getOracle() external view returns (address) {
         return _oracle;
     }
 
-    function getDAO() external view returns (address) {
-        return _DAO;
+    function getVault() external view returns (address) {
+        return _vault;
+    }
+
+    function getClaimNonce(uint FID) external view returns (uint) {
+        return _claimNonces[FID];
     }
 
     function getFide(uint FID) external view returns (address) {
         return _fides[FID];
+    }
+
+    function getLastLikeTime(uint likerFID, uint likedFID) external view returns (uint) {
+        return _lastLikeTimes[likerFID][likedFID];
+    }
+
+    function getClaimNonces(uint[] memory FIDs) external view returns (uint[] memory) {
+        uint[] memory claimNonces = new uint[](FIDs.length);
+        for (uint i = 0; i < FIDs.length; i++) {
+            claimNonces[i] = _claimNonces[FIDs[i]];
+        }
+        return claimNonces;
     }
 
     function getFides(uint[] memory FIDs) external view returns (address[] memory) {
@@ -129,5 +162,13 @@ contract Minter {
             fides[i] = _fides[FIDs[i]];
         }
         return fides;
+    }
+
+    function getLastLikeTimes(uint[] memory likerFIDs, uint[] memory likedFIDs) external view returns (uint[] memory) {
+        uint[] memory lastLikeTimes = new uint[](likerFIDs.length);
+        for (uint i = 0; i < likerFIDs.length; i++) {
+            lastLikeTimes[i] = _lastLikeTimes[likerFIDs[i]][likedFIDs[i]];
+        }
+        return lastLikeTimes;
     }
 }
