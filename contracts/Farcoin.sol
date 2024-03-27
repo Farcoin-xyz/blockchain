@@ -1,149 +1,46 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ERC20, ERC20Votes} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
-import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import {Minter} from "./Minter.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import {ERC20Votes} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
+import {ERC165} from "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
 
-contract Farcoin is ERC20Votes {
-    uint private _tokensIssued = 0;
-    uint private _unclaimedFees = 0;
-    address private _minter;
-
-    uint private constant MAX_TOKEN_BUY = 1000000000; // Prevent Multiplicative Overflows
-    uint private constant BASE_PRICE = 1 gwei;
+contract Farcoin is ERC20, ERC20Burnable, ERC20Permit, ERC20Votes, ERC165 {
+    uint private constant ONE_HUNDRED_BILLION = 100000000000;
     uint private constant TOKEN_UNIT = 10 ** 18;
-    uint public constant FEE_PCT = 1;
-    uint public constant TRADE_TYPE_BUY = 1;
-    uint public constant TRADE_TYPE_SELL = 2;
 
-    event Trade (
-        address indexed owner,
-        uint indexed tradeType,
-        uint tokens,
-        uint bond,
-        uint fees,
-        uint supply,
-        uint timestamp
-    );
-
-    constructor(address minter) ERC20("Farcoin", "FRC") EIP712("Farcoin", "1") {
-        _minter = minter;
+    constructor() ERC20("Farcoin", "FRC") ERC20Permit("Farcoin") {
+        _mint(_msgSender(), TOKEN_UNIT * ONE_HUNDRED_BILLION);
     }
 
-    function buy(uint tokens, uint minTokens) public payable {
-        require(tokens >= minTokens && tokens > 0 && tokens <= MAX_TOKEN_BUY, "Invalid Order");
-
-        uint maxBond = _getMaxBond(msg.value);
-        uint oldSupply = _tokensIssued;
-        uint totalBonded = _getTotalBonded(oldSupply);
-
-        uint newTokens = tokens;
-        uint bond = _getTotalBonded(oldSupply + newTokens) - totalBonded;
-        if (bond > maxBond) { // Not enough sent to buy `tokens`, find the max we can get
-            newTokens = minTokens;
-            bond = _getTotalBonded(oldSupply + newTokens) - totalBonded;
-            require(bond <= maxBond, "Unable To Buy Minimum Tokens");
-
-            // Search for the max token amount
-            uint testTokens = (tokens - minTokens) / 2;
-            while (testTokens != 0) {
-                bond = _getTotalBonded(oldSupply + newTokens + testTokens) - totalBonded;
-                if (bond <= maxBond) {
-                    newTokens += testTokens;
-                    testTokens = (testTokens / 2) + 1;
-                } else {
-                    testTokens /= 2;
-                }
-            }
-            bond = _getTotalBonded(oldSupply + newTokens) - totalBonded;
-        }
-        uint newSupply = oldSupply + newTokens;
-        uint fees = _getFeesToBond(bond);
-
-        _mint(msg.sender, newTokens * TOKEN_UNIT);
-        _tokensIssued = newSupply;
-        _unclaimedFees += fees;
-
-        uint excess = msg.value - bond - fees;
-        if (excess >= 1 gwei) { // Don't refund dust
-            (bool sent,) = msg.sender.call{value: excess}("");
-            require(sent, "Unable To Refund Excess");
-        }
-
-        emit Trade(
-            msg.sender,
-            TRADE_TYPE_BUY,
-            newTokens,
-            bond,
-            fees,
-            newSupply,
-            block.timestamp
-        );
+    // ERC-165
+    function supportsInterface(bytes4 interfaceId) public view virtual override returns (bool) {
+        return interfaceId == 0xa219a025    // IERC20Metadata
+        || interfaceId == 0x36372b07        // IERC20
+        || interfaceId == 0xe90fb3f6        // IVotes
+        || interfaceId == 0x84b0196e        // IERC5267
+        || interfaceId == 0xda287a1d        // IERC6372
+        || interfaceId == 0x01ffc9a7;       // IERC165
     }
 
-    function sell(uint tokens, uint minProceeds) public {
-        uint oldSupply = _tokensIssued;
-        require(tokens <= oldSupply, "Invalid Order");
-        uint newSupply = oldSupply - tokens;
-
-        uint bond = _getTotalBonded(oldSupply) - _getTotalBonded(newSupply);
-        uint fees = bond * FEE_PCT / 100;
-        uint send = bond - fees;
-
-        require(send >= minProceeds, "Unable To Sell For Min Proceeds");
-
-        _burn(msg.sender, tokens * TOKEN_UNIT);
-        _tokensIssued = newSupply;
-        _unclaimedFees += fees;
-
-        (bool sent,) = msg.sender.call{value: send}("");
-        require(sent, "Unable To Send Proceeds");
-
-        emit Trade(
-            msg.sender,
-            TRADE_TYPE_SELL,
-            tokens,
-            bond,
-            fees,
-            newSupply,
-            block.timestamp
-        );
+    // ERC-6372
+    function clock() public view override returns (uint48) {
+        return uint48(block.timestamp);
     }
 
-    function _getFeesToBond(uint bondWei) private pure returns (uint) {
-        return (bondWei * 100 / (100 - FEE_PCT)) - bondWei;
+    function CLOCK_MODE() public pure override returns (string memory) {
+        return "mode=timestamp";
     }
 
-    function _getTotalBonded(uint supply) private pure returns (uint) {
-        // The price of each token is N * BASE_PRICE, where N is the supply
-        // Sum the natural numbers and multiply by the base price to get the total value bonded
-        return BASE_PRICE * supply * (supply + 1) / 2;
+    // The functions below are overrides required by Solidity.
+    function _update(address from, address to, uint256 amount) internal override(ERC20, ERC20Votes) {
+        super._update(from, to, amount);
     }
 
-    function _getMaxBond(uint sentWei) private pure returns (uint) {
-        return sentWei * ((100 - FEE_PCT) / 100);
-    }
-
-    function claimFees() external {
-        address recipient = Minter(_minter).getGovernance();
-
-        uint feesWei = _unclaimedFees;
-        _unclaimedFees = 0;
-
-        (bool sent,) = recipient.call{value: feesWei}("");
-        require(sent, "Unable To Send Fee");
-    }
-
-    function getUnclaimedFees() external view returns (uint) {
-        return _unclaimedFees;
-    }
-
-    function getTokensIssued() external view returns (uint) {
-        return _tokensIssued;
-    }
-
-    function getTotalBonded() external view returns (uint256) {
-        return _getTotalBonded(_tokensIssued);
+    function nonces(address owner) public view virtual override(ERC20Permit, Nonces) returns (uint256) {
+        return super.nonces(owner);
     }
 }
