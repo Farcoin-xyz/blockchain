@@ -1,41 +1,25 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/proxy/Clones.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {Minter} from "./Minter.sol";
 
 contract Oracle {
-    mapping(uint => uint) _claimNonce;
-    mapping(uint => mapping(uint => uint)) _lastLikeTime;
-    mapping(address => bool) _signerAuthorized;
+    address private immutable _minter;
+    address private _federation;
+
     uint private _minimumSigners = 1;
-    address private _minter;
+    mapping(address => bool) _signerAuthorized;
 
-    event VerifiedMint(
-        uint indexed likerFID,
-        uint indexed likedFID,
-        address indexed recipient,
-        uint quantity,
-        uint firstLikeTime,
-        uint lastLikeTime
-    );
-
-    event VerifiedClaim(
-        uint indexed FID,
-        address indexed recipient,
-        uint indexed nonce,
-        uint quantity
-    );
-
-    modifier onlyGovernance {
-        require(msg.sender == Minter(_minter).getGovernance());
+    modifier onlyFederation {
+        require(msg.sender == _federation, "Not Federation");
         _;
     }
 
     constructor(address minter) {
-        minter = _minter;
+        _minter = minter;
+        _federation = msg.sender;
     }
 
     function _verify(bytes32 digest, bytes[] memory signatures) private view {
@@ -55,72 +39,51 @@ contract Oracle {
     function verifyAndMint(
         uint[] memory likerFIDs,
         uint[] memory likedFIDs,
-        address[] memory recipients,
+        address[] memory likers,
+        address[] memory likeds,
         uint[] memory quantities,
         uint[] memory firstLikeTimes,
         uint[] memory lastLikeTimes,
         bytes[] memory signatures
     ) external {
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(keccak256(
-            abi.encode(likerFIDs, likedFIDs, recipients, quantities, firstLikeTimes, lastLikeTimes)
+            abi.encode(likerFIDs, likedFIDs, likers, likeds, quantities, firstLikeTimes, lastLikeTimes)
         ));
         _verify(digest, signatures);
-
-        Minter minter = Minter(_minter);
-        for (uint i = 0; i < likerFIDs.length; i++) {
-            uint likerFID = likerFIDs[i];
-            uint likedFID = likedFIDs[i];
-            address recipient = recipients[i];
-            uint quantity = quantities[i];
-            uint firstLikeTime = firstLikeTimes[i];
-            uint lastLikeTime = lastLikeTimes[i];
-
-            require(firstLikeTime <= lastLikeTime, "Invalid Time Range");
-            require(firstLikeTime > _lastLikeTime[likerFID][likedFID], "Likes Already Minted");
-
-            _lastLikeTime[likerFID][likedFID] = lastLikeTime;
-            minter.mint(likerFID, recipient, quantity);
-
-            emit VerifiedMint(likerFID, likedFID, recipient, quantity, firstLikeTime, lastLikeTime);
-        }
+        Minter(_minter).mint(likerFIDs, likedFIDs, likers, likeds, quantities, firstLikeTimes, lastLikeTimes);
     }
 
     function verifyAndClaim(
-        uint[] memory FIDs,
-        address[] memory recipients,
+        uint[] memory likerFIDs,
+        address[] memory likers,
         uint[] memory nonces,
         bytes[] memory signatures
     ) external {
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(keccak256(
-            abi.encode(FIDs, recipients, nonces)
+            abi.encode(likerFIDs, likers, nonces)
         ));
         _verify(digest, signatures);
-
-        Minter minter = Minter(_minter);
-        for (uint i = 0; i < FIDs.length; i++) {
-            uint FID = FIDs[i];
-            address recipient = recipients[i];
-            uint nonce = nonces[i];
-
-            require(_claimNonce[FID] + 1 == nonce, "Invalid Nonce");
-
-            _claimNonce[FID] = nonce;
-            uint quantity = minter.claim(FID, recipient);
-
-            emit VerifiedClaim(FID, recipient, nonce, quantity);
-        }
+        Minter(_minter).claim(likerFIDs, likers, nonces);
     }
 
-    function setMinimumSigners(uint minimumSigners) external onlyGovernance {
+    function setFederation(address federation) external onlyFederation {
+        _federation = federation;
+    }
+
+    function setMinimumSigners(uint minimumSigners) external onlyFederation {
         require(minimumSigners > 0, "Minimum 1 Signer Required");
 
         _minimumSigners = minimumSigners;
     }
 
-    function setSignerAuthorized(address signer, bool authorized) external onlyGovernance {
-        require(signer != address(0), "Invalid Address");
+    function setSignerAuthorized(address signer, bool authorized) external onlyFederation {
+        require(signer != address(0), "Invalid Signer Address");
 
         _signerAuthorized[signer] = authorized;
+    }
+
+    function getFederation() external view returns (address) {
+        return _federation;
     }
 
     function getSignerAuthorized(address addr) external view returns (bool) {
@@ -131,19 +94,7 @@ contract Oracle {
         return _minimumSigners;
     }
 
-    function getClaimNonce(uint FID) external view returns (uint) {
-        return _claimNonce[FID];
-    }
-
-    function getLastLikeTime(uint likerFID, uint likedFID) external view returns (uint) {
-        return _lastLikeTime[likerFID][likedFID];
-    }
-
-    function getLastLikeTimeBatch(uint[] memory likerFIDs, uint[] memory likedFIDs) external view returns (uint[] memory) {
-        uint[] memory lastLikes = new uint[](likerFIDs.length);
-        for (uint i = 0; i < likerFIDs.length; i++) {
-            lastLikes[i] = _lastLikeTime[likerFIDs[i]][likedFIDs[i]];
-        }
-        return lastLikes;
+    function getMinter() external view returns (address) {
+        return _minter;
     }
 }
